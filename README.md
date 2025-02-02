@@ -1,3 +1,3 @@
 # gre-go
 
-A simple Go implementation of the GRE protocol.
+A prototype that implements a simple GRE tunnel (RFC 2784) in Go using the Wintun library.
