@@ -1,0 +1,68 @@
+package gre
+
+import (
+	"testing"
+
+	"golang.zx2c4.com/wireguard/windows/elevate"
+)
+
+func TestNewDefaultGREAdapter(t *testing.T) {
+	if err := elevate.DoAsSystem(func() error {
+		adapter, err := NewDefaultGREAdapter()
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		if adapter == nil {
+			t.Fatal("expected adapter, got nil")
+		}
+
+		if adapter.LUID() == 0 {
+			t.Fatalf("expected luid, got 0")
+		}
+
+		if adapter.Adapter() == nil {
+			t.Fatalf("expected adapter, got nil")
+		}
+
+		adapter.Start()
+		if err := adapter.Close(); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
+func TestNewGREAdapter(t *testing.T) {
+	adapterName := "test0"
+	if err := elevate.DoAsSystem(func() error {
+		adapter, err := NewGREAdapter(adapterName)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		if adapter == nil {
+			t.Fatal("expected adapter, got nil")
+		}
+
+		if adapter.LUID() == 0 {
+			t.Fatalf("expected luid, got 0")
+		}
+
+		if adapter.Adapter() == nil {
+			t.Fatalf("expected adapter, got nil")
+		}
+
+		adapter.Start()
+		if err := adapter.Close(); err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
