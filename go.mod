@@ -8,6 +8,7 @@ require (
 )
 
 require (
+	github.com/google/gopacket v1.1.19 // indirect
 	github.com/lxn/walk v0.0.0-20210112085537-c389da54e794 // indirect
 	github.com/lxn/win v0.0.0-20210218163916-a377121e959e // indirect
 	golang.org/x/crypto v0.0.0-20211215153901-e495a2d5b3d3 // indirect
