@@ -1,4 +1,4 @@
-module github.com/banyansecurity/go-gre-windows
+module github.com/banyansecurity/gre-go-windows
 
 go 1.22.0
 
