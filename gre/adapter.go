@@ -1,59 +1,71 @@
 package gre
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/puzpuzpuz/xsync"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wintun"
 )
 
+var (
+	greLogFileName = filepath.Join("Logs", "gre.log")
+)
+
 const (
-	defaultAdapterName = "gre0"
+	defaultAdapterName = "mgre1"
 	wintunTunnelType   = "Wintun"
 	sessionCapacity    = 0x400000
 	profilesPath       = "Software\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles"
 )
 
-type GREAdapter struct {
-	sync.RWMutex
-	logger              *slog.Logger
-	name                string
-	luid                uint64
-	adapter             *wintun.Adapter
-	thisSide, otherSide net.IP
-	shutdownChans       []chan struct{}
-	shutdownGroup       sync.WaitGroup
-}
+type (
+	GREAdapter struct {
+		sync.RWMutex
+		logFile       *os.File
+		logger        *slog.Logger
+		name          string
+		guid          *windows.GUID
+		luid          uint64
+		adapter       *wintun.Adapter
+		validSrcs     *xsync.MapOf[string, net.IP]
+		validDsts     *xsync.MapOf[string, net.IP]
+		tunnelIP      net.IP
+		dnsIP         net.IP
+		shutdownChans []chan struct{}
+		shutdownGroup sync.WaitGroup
+		counter       uint16
+	}
+)
 
 func NewDefaultGREAdapter() (*GREAdapter, error) {
-	return NewGREAdapter(defaultAdapterName, nil, nil)
+	return NewGREAdapter(defaultAdapterName)
 }
 
-func NewGREAdapter(adapterName string, thisSide, otherSide net.IP) (*GREAdapter, error) {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+func NewGREAdapter(adapterName string) (*GREAdapter, error) {
+	_ = wintun.Uninstall()
+	_ = removeOrphanedProfile(adapterName)
+
+	logFile, err := os.OpenFile(greLogFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	logger := slog.New(slog.NewJSONHandler(logFile, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	}))
-	if existingAdapter, err := wintun.OpenAdapter(adapterName); err == nil {
-		logger.Info(
-			"opened existing adapter",
-			"luid", existingAdapter.LUID())
-		return &GREAdapter{
-			logger:    logger,
-			name:      adapterName,
-			luid:      existingAdapter.LUID(),
-			adapter:   existingAdapter,
-			thisSide:  thisSide,
-			otherSide: otherSide,
-		}, nil
-	}
 
 	guid, err := windows.GenerateGUID()
 	if err != nil {
@@ -69,14 +81,60 @@ func NewGREAdapter(adapterName string, thisSide, otherSide net.IP) (*GREAdapter,
 		"created adapter",
 		"luid", adapter.LUID())
 	return &GREAdapter{
+		logFile:   logFile,
 		logger:    logger,
 		name:      adapterName,
+		guid:      &guid,
 		luid:      adapter.LUID(),
 		adapter:   adapter,
-		thisSide:  thisSide,
-		otherSide: otherSide,
+		validSrcs: xsync.NewTypedMapOf[string, net.IP](xsync.StrHash64),
+		validDsts: xsync.NewTypedMapOf[string, net.IP](xsync.StrHash64),
+		counter:   uint16(rand.Intn(math.MaxUint16 + 1)),
 	}, nil
+}
 
+func (a *GREAdapter) WithDNSIP(dnsIP net.IP) *GREAdapter {
+	a.Lock()
+	defer a.Unlock()
+
+	a.dnsIP = dnsIP
+	return a
+}
+
+func (a *GREAdapter) DNSIP() net.IP {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.dnsIP
+}
+
+func (a *GREAdapter) WithTunnelIP(tunnelIP net.IP) *GREAdapter {
+	a.Lock()
+	defer a.Unlock()
+
+	a.tunnelIP = tunnelIP
+	return a
+}
+
+func (a *GREAdapter) TunnelIP() net.IP {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.tunnelIP
+}
+
+func (a *GREAdapter) Name() string {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.name
+}
+
+func (a *GREAdapter) GUID() *windows.GUID {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.guid
 }
 
 func (a *GREAdapter) LUID() uint64 {
@@ -112,6 +170,7 @@ func (a *GREAdapter) Close() error {
 	defer func() {
 		_ = wintun.Uninstall()
 		_ = removeOrphanedProfile(a.name)
+		_ = a.logFile.Close()
 	}()
 
 	for _, shutdownChan := range a.shutdownChans {
@@ -120,6 +179,24 @@ func (a *GREAdapter) Close() error {
 
 	return a.adapter.Close()
 }
+
+func (a *GREAdapter) AddAccessTierSourceRoute(accessTierSide, connectorSide net.IP) {
+	a.validSrcs.Store(accessTierSide.String(), connectorSide)
+}
+
+func (a *GREAdapter) RemoveAccessTierSourceRoute(accessTierSide net.IP) {
+	a.validSrcs.Delete(accessTierSide.String())
+}
+
+func (a *GREAdapter) AddConnectorReturnRoute(connectorSide, accessTierSide net.IP) {
+	a.validDsts.Store(connectorSide.String(), accessTierSide)
+}
+
+func (a *GREAdapter) RemoveConnectorReturnRoute(connectorSide net.IP) {
+	a.validDsts.Delete(connectorSide.String())
+}
+
+const missThreshold = 10
 
 func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
 	defer a.shutdownGroup.Done()
@@ -136,14 +213,11 @@ func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
 	// generally improve performance here when we don't spin on allocations
 	// for each packet.
 	var (
-		llc           layers.LLC
-		gre           layers.GRE
-		ip4           layers.IPv4
-		payload       gopacket.Payload
-		decodedLayers []gopacket.LayerType
-		parser        = gopacket.NewDecodingLayerParser(layers.LayerTypeGRE, &llc, &gre, &ip4, &payload)
-		buf           = gopacket.NewSerializeBuffer()
+		ip4      layers.IPv4
+		ipParser = gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip4)
+		decoded  = make([]gopacket.LayerType, 1)
 	)
+	ipParser.IgnoreUnsupported = true
 
 forever:
 	for {
@@ -153,6 +227,9 @@ forever:
 		default:
 		}
 
+		// This is the primary notification mechanism for us to wake up and
+		// receive packets. Note that although we get a single notification here,
+		// there are likely multiple packets that we're able to receive at once.
 		if _, err := windows.WaitForSingleObject(session.ReadWaitEvent(), windows.INFINITE); err != nil {
 			a.logger.Warn(
 				"error waiting for read wait event",
@@ -160,87 +237,305 @@ forever:
 			continue
 		}
 
-		packet, err := session.ReceivePacket()
-		if err != nil {
-			a.logger.Warn(
-				"error receiving packet",
-				"error", err)
-			continue
-		}
+		// The inner loop spins on receiving packets multiple times before we fall
+		// back to waiting for a notification for performance reasons.
+		var consecutiveMisses int
+		for {
+			if consecutiveMisses >= missThreshold {
+				break
+			}
 
-		if err := parser.DecodeLayers(packet, &decodedLayers); err != nil {
-			a.logger.Warn(
-				"error decoding layers",
-				"error", err)
-			goto cleanupReceivePacket
-		}
+			packet, err := session.ReceivePacket()
+			if err != nil {
+				consecutiveMisses++
+				continue
+			} else {
+				consecutiveMisses = 0
+			}
 
-		for _, layer := range decodedLayers {
-			switch layer {
-			case layers.LayerTypeGRE:
-				if gre.Protocol != layers.EthernetTypeIPv4 {
-					continue
+			if err := ipParser.DecodeLayers(packet, &decoded); err != nil {
+				goto cleanupReceivePacket
+			}
+
+			switch ip4.Protocol {
+			case layers.IPProtocolGRE:
+				a.logger.Debug(
+					"deencapsulating gre packet",
+					"src", ip4.SrcIP,
+					"dst", ip4.DstIP)
+				if err := a.handleInboundGRE(session, ip4.LayerPayload()); err != nil {
+					a.logger.Warn(
+						"error handling inbound gre payload",
+						"error", err)
+					goto cleanupReceivePacket
+				}
+			case layers.IPProtocolUDP:
+				if a.maybeRequiresOutboundProxying(ip4) {
+					if err := a.proxyInboundUDP(session, ip4.LayerPayload(), ip4); err != nil {
+						a.logger.Warn(
+							"error handling inbound udp payload",
+							"error", err)
+						goto cleanupReceivePacket
+					}
+				} else if accessTierIP, requiresProxying := a.hasConnectorReturnRoute(ip4); requiresProxying {
+					if err := a.proxyOutboundUDP(session, ip4.LayerPayload(), accessTierIP); err != nil {
+						a.logger.Warn(
+							"error handling outbound udp payload",
+							"error", err)
+						goto cleanupReceivePacket
+					}
+				}
+			default:
+				if accessTierGREDst, requiresEncapsulation := a.hasConnectorReturnRoute(ip4); requiresEncapsulation {
+					a.logger.Debug(
+						"encapsulating gre packet",
+						"src", ip4.SrcIP,
+						"dst", ip4.DstIP)
+					if err := a.handleOutboundGRE(session, packet, accessTierGREDst); err != nil {
+						a.logger.Warn(
+							"error handling outbound gre payload",
+							"error", err)
+						goto cleanupReceivePacket
+					}
 				}
 			}
-		}
 
-		if ip4.SrcIP.Equal(a.otherSide) && ip4.DstIP.Equal(a.thisSide) {
-			if err := a.deencapsulate(buf, payload); err != nil {
-				a.logger.Warn(
-					"error deencapsulating packet",
-					"error", err)
-				goto cleanupReceivePacket
-			}
-		} else {
-			if err := a.encapsulate(buf, ip4, payload); err != nil {
-				a.logger.Warn(
-					"error encapsulating packet",
-					"error", err)
-				goto cleanupReceivePacket
-			}
-		}
-		session.SendPacket(buf.Bytes())
-
-	cleanupReceivePacket:
-		session.ReleaseReceivePacket(packet)
-	}
+		cleanupReceivePacket:
+			session.ReleaseReceivePacket(packet)
+		} // inner loop
+	} // forever loop
 }
 
-func (a *GREAdapter) deencapsulate(buf gopacket.SerializeBuffer, payload gopacket.Payload) error {
-	if err := payload.SerializeTo(buf, gopacket.SerializeOptions{
-		FixLengths:       false,
-		ComputeChecksums: false,
-	}); err != nil {
+func (a *GREAdapter) hasAccessTierSourceRoute(ip4 layers.IPv4) (net.IP, bool) {
+	return a.validSrcs.Load(ip4.SrcIP.String())
+}
+
+func (a *GREAdapter) hasConnectorReturnRoute(ip4 layers.IPv4) (net.IP, bool) {
+	return a.validDsts.Load(ip4.DstIP.String())
+}
+
+func (a *GREAdapter) maybeRequiresOutboundProxying(ip4 layers.IPv4) bool {
+	return ip4.Protocol == layers.IPProtocolUDP && ip4.DstIP.Equal(a.TunnelIP())
+}
+
+func (a *GREAdapter) handleInboundGRE(session wintun.Session, packet []byte) error {
+	var (
+		gre       layers.GRE
+		greParser = gopacket.NewDecodingLayerParser(layers.LayerTypeGRE, &gre)
+		decoded   = make([]gopacket.LayerType, 1)
+	)
+	greParser.IgnoreUnsupported = true
+	if err := greParser.DecodeLayers(packet, &decoded); err != nil {
 		return err
 	}
 
+	var (
+		payload   = gre.LayerPayload()
+		totalSize = len(payload)
+	)
+	outgoingPacket, err := session.AllocateSendPacket(totalSize)
+	if err != nil {
+		return err
+	}
+
+	copy(outgoingPacket, payload)
+	session.SendPacket(outgoingPacket)
 	return nil
 }
 
-func (a *GREAdapter) encapsulate(buf gopacket.SerializeBuffer, ip4 layers.IPv4, payload gopacket.Payload) error {
-	returnOpts := gopacket.SerializeOptions{
-		FixLengths:       false,
-		ComputeChecksums: true,
-	}
-	if err := payload.SerializeTo(buf, returnOpts); err != nil {
+func (a *GREAdapter) handleOutboundGRE(session wintun.Session, packet []byte, dst net.IP) error {
+	var (
+		ip4 layers.IPv4
+		gre layers.GRE
+	)
+	ip4.Version = 4
+	ip4.Id = a.nextCounter()
+	ip4.Flags = layers.IPv4DontFragment
+	ip4.TTL = 64
+	ip4.Protocol = layers.IPProtocolGRE
+	ip4.SrcIP = a.TunnelIP()
+	ip4.DstIP = dst
+
+	gre.KeyPresent = true
+	gre.Protocol = 0x0800
+	gre.Key = 0x000004D2
+
+	var (
+		buf  = gopacket.NewSerializeBuffer()
+		opts = gopacket.SerializeOptions{
+			ComputeChecksums: true,
+			FixLengths:       true,
+		}
+		payload = gopacket.Payload(packet)
+	)
+	if err := gopacket.SerializeLayers(buf, opts, &ip4, &gre, payload); err != nil {
 		return err
 	}
 
-	ip4.SrcIP = a.thisSide
-	ip4.DstIP = a.otherSide
-	if err := ip4.SerializeTo(buf, returnOpts); err != nil {
+	var (
+		returnPacketBytes = buf.Bytes()
+		totalSize         = len(returnPacketBytes)
+	)
+	outgoingPacket, err := session.AllocateSendPacket(totalSize)
+	if err != nil {
 		return err
 	}
 
-	gre := layers.GRE{
-		ChecksumPresent: true,
-		Protocol:        layers.EthernetTypeIPv4,
-	}
-	if err := gre.SerializeTo(buf, returnOpts); err != nil {
-		return err
-	}
-
+	copy(outgoingPacket, returnPacketBytes)
+	session.SendPacket(outgoingPacket)
 	return nil
+}
+
+var (
+	ErrCannotProxy = errors.New("cannot proxy")
+)
+
+func (a *GREAdapter) proxyInboundUDP(session wintun.Session, packet []byte, outerIP4 layers.IPv4) error {
+	var (
+		ip4       layers.IPv4
+		udp       layers.UDP
+		udpParser = gopacket.NewDecodingLayerParser(layers.LayerTypeUDP, &udp)
+		decoded   = make([]gopacket.LayerType, 1)
+	)
+	udpParser.IgnoreUnsupported = true
+	if err := udpParser.DecodeLayers(packet, &decoded); err != nil {
+		return err
+	}
+
+	// We only handle proxying for outbound DNS payloads here.
+	connectorIP, canProxy := a.hasAccessTierSourceRoute(outerIP4)
+	if udp.DstPort != 53 || !canProxy {
+		return ErrCannotProxy
+	}
+
+	ip4.Version = 4
+	ip4.Id = a.nextCounter()
+	ip4.Flags = layers.IPv4DontFragment
+	ip4.TTL = 64
+	ip4.Protocol = layers.IPProtocolUDP
+	ip4.SrcIP = connectorIP
+	ip4.DstIP = a.DNSIP()
+
+	udp.Checksum = 0
+	udp.SetNetworkLayerForChecksum(&ip4)
+
+	var (
+		buf  = gopacket.NewSerializeBuffer()
+		opts = gopacket.SerializeOptions{
+			ComputeChecksums: true,
+			FixLengths:       true,
+		}
+		payload = gopacket.Payload(udp.LayerPayload())
+	)
+	if err := gopacket.SerializeLayers(buf, opts, &ip4, &udp, payload); err != nil {
+		return err
+	}
+
+	var (
+		returnPacketBytes = buf.Bytes()
+		totalSize         = len(returnPacketBytes)
+	)
+	outgoingPacket, err := session.AllocateSendPacket(totalSize)
+	if err != nil {
+		return err
+	}
+
+	copy(outgoingPacket, returnPacketBytes)
+	session.SendPacket(outgoingPacket)
+	return nil
+}
+
+func (a *GREAdapter) proxyOutboundUDP(session wintun.Session, packet []byte, dst net.IP) error {
+	var (
+		outerIP4  layers.IPv4
+		gre       layers.GRE
+		ip4       layers.IPv4
+		udp       layers.UDP
+		udpParser = gopacket.NewDecodingLayerParser(layers.LayerTypeUDP, &udp)
+		decoded   = make([]gopacket.LayerType, 1)
+	)
+	udpParser.IgnoreUnsupported = true
+	if err := udpParser.DecodeLayers(packet, &decoded); err != nil {
+		return err
+	}
+
+	// We only handle proxying for inbound DNS payloads here.
+	if udp.SrcPort != 53 {
+		return ErrCannotProxy
+	}
+
+	// Well, this is a little bit of a hack. Note that we apply a NAT rule on
+	// this interface which causes Windows to modify the IP header to use the
+	// public interface IP. That works for the most part except in the case where
+	// we try to send packets direct to the WireGuard interface without the
+	// tunnel, such as for DNS packets or pings. In that case, we get into a case
+	// where the packets traversing into WireGuard erroneusly have the public
+	// interface IP as the source IP!
+	//
+	// So, to work around this, we *encapsulate* this return payload in the GRE
+	// tunnel which causes this traffic to skip past the NAT logic that would
+	// usually apply to TCP, UDP, and ICMP traffic. Unfortunately, this looks
+	// pretty weird because the inbound packet is not encapsulated while the
+	// outbound response packet is.
+	outerIP4.Version = 4
+	outerIP4.Id = a.nextCounter()
+	outerIP4.Flags = layers.IPv4DontFragment
+	outerIP4.TTL = 64
+	outerIP4.Protocol = layers.IPProtocolGRE
+	outerIP4.SrcIP = a.TunnelIP()
+	outerIP4.DstIP = dst
+
+	gre.KeyPresent = true
+	gre.Protocol = 0x0800
+	gre.Key = 0x000004D2
+
+	ip4.Version = 4
+	ip4.Id = a.nextCounter()
+	ip4.Flags = layers.IPv4DontFragment
+	ip4.TTL = 64
+	ip4.Protocol = layers.IPProtocolUDP
+	ip4.SrcIP = a.TunnelIP()
+	ip4.DstIP = dst
+
+	udp.Checksum = 0
+	udp.SetNetworkLayerForChecksum(&ip4)
+
+	var (
+		buf  = gopacket.NewSerializeBuffer()
+		opts = gopacket.SerializeOptions{
+			ComputeChecksums: true,
+			FixLengths:       true,
+		}
+		payload = gopacket.Payload(udp.LayerPayload())
+	)
+	if err := gopacket.SerializeLayers(buf, opts, &outerIP4, &gre, &ip4, &udp, payload); err != nil {
+		return err
+	}
+
+	var (
+		returnPacketBytes = buf.Bytes()
+		totalSize         = len(returnPacketBytes)
+	)
+	outgoingPacket, err := session.AllocateSendPacket(totalSize)
+	if err != nil {
+		return err
+	}
+
+	copy(outgoingPacket, returnPacketBytes)
+	session.SendPacket(outgoingPacket)
+	return nil
+}
+
+func (a *GREAdapter) nextCounter() uint16 {
+	defer func() {
+		a.counter++
+	}()
+
+	if a.counter > math.MaxUint16 {
+		a.counter = 0
+	}
+
+	return a.counter
 }
 
 func removeOrphanedProfile(adapterName string) error {
