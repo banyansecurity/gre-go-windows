@@ -3,57 +3,64 @@ package gre
 import (
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wintun"
 )
 
+var (
+	greLogFileName = filepath.Join("Logs", "gre.log")
+)
+
 const (
-	defaultAdapterName = "gre0"
+	defaultAdapterName = "mgre1"
 	wintunTunnelType   = "Wintun"
 	sessionCapacity    = 0x400000
 	profilesPath       = "Software\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles"
 )
 
-type GREAdapter struct {
-	sync.RWMutex
-	logger              *slog.Logger
-	name                string
-	luid                uint64
-	adapter             *wintun.Adapter
-	thisSide, otherSide net.IP
-	shutdownChans       []chan struct{}
-	shutdownGroup       sync.WaitGroup
-}
+type (
+	GREAdapter struct {
+		sync.RWMutex
+		logFile       *os.File
+		logger        *slog.Logger
+		name          string
+		guid          *windows.GUID
+		luid          uint64
+		adapter       *wintun.Adapter
+		tunnelIP      net.IP
+		dnsIP         net.IP
+		shutdownChans []chan struct{}
+		shutdownGroup sync.WaitGroup
+		counter       uint16
+		router        *PacketRouting
+	}
+)
 
 func NewDefaultGREAdapter() (*GREAdapter, error) {
-	return NewGREAdapter(defaultAdapterName, nil, nil)
+	return NewGREAdapter(defaultAdapterName)
 }
 
-func NewGREAdapter(adapterName string, thisSide, otherSide net.IP) (*GREAdapter, error) {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-	if existingAdapter, err := wintun.OpenAdapter(adapterName); err == nil {
-		logger.Info(
-			"opened existing adapter",
-			"luid", existingAdapter.LUID())
-		return &GREAdapter{
-			logger:    logger,
-			name:      adapterName,
-			luid:      existingAdapter.LUID(),
-			adapter:   existingAdapter,
-			thisSide:  thisSide,
-			otherSide: otherSide,
-		}, nil
+func NewGREAdapter(adapterName string) (*GREAdapter, error) {
+	_ = wintun.Uninstall()
+	_ = removeOrphanedProfile(adapterName)
+
+	logFile, err := os.OpenFile(greLogFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
 	}
+
+	logger := slog.New(slog.NewJSONHandler(logFile, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	}))
 
 	guid, err := windows.GenerateGUID()
 	if err != nil {
@@ -68,15 +75,65 @@ func NewGREAdapter(adapterName string, thisSide, otherSide net.IP) (*GREAdapter,
 	logger.Info(
 		"created adapter",
 		"luid", adapter.LUID())
-	return &GREAdapter{
-		logger:    logger,
-		name:      adapterName,
-		luid:      adapter.LUID(),
-		adapter:   adapter,
-		thisSide:  thisSide,
-		otherSide: otherSide,
-	}, nil
+	greAdapter := &GREAdapter{
+		logFile: logFile,
+		logger:  logger,
+		name:    adapterName,
+		guid:    &guid,
+		luid:    adapter.LUID(),
+		adapter: adapter,
+		counter: uint16(rand.Intn(math.MaxUint16 + 1)),
+	}
+	greAdapter.router = NewPacketRouting(greAdapter)
+	return greAdapter, nil
+}
 
+func (a *GREAdapter) PacketRouting() *PacketRouting {
+	return a.router
+}
+
+func (a *GREAdapter) WithDNSIP(dnsIP net.IP) *GREAdapter {
+	a.Lock()
+	defer a.Unlock()
+
+	a.dnsIP = dnsIP
+	return a
+}
+
+func (a *GREAdapter) DNSIP() net.IP {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.dnsIP
+}
+
+func (a *GREAdapter) WithTunnelIP(tunnelIP net.IP) *GREAdapter {
+	a.Lock()
+	defer a.Unlock()
+
+	a.tunnelIP = tunnelIP
+	return a
+}
+
+func (a *GREAdapter) TunnelIP() net.IP {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.tunnelIP
+}
+
+func (a *GREAdapter) Name() string {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.name
+}
+
+func (a *GREAdapter) GUID() *windows.GUID {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.guid
 }
 
 func (a *GREAdapter) LUID() uint64 {
@@ -112,6 +169,7 @@ func (a *GREAdapter) Close() error {
 	defer func() {
 		_ = wintun.Uninstall()
 		_ = removeOrphanedProfile(a.name)
+		_ = a.logFile.Close()
 	}()
 
 	for _, shutdownChan := range a.shutdownChans {
@@ -120,6 +178,8 @@ func (a *GREAdapter) Close() error {
 
 	return a.adapter.Close()
 }
+
+const missThreshold = 100
 
 func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
 	defer a.shutdownGroup.Done()
@@ -132,19 +192,6 @@ func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
 	}
 	defer session.End()
 
-	// Note: Prefer to preallocate *whatever* we can on the stack. This will
-	// generally improve performance here when we don't spin on allocations
-	// for each packet.
-	var (
-		llc           layers.LLC
-		gre           layers.GRE
-		ip4           layers.IPv4
-		payload       gopacket.Payload
-		decodedLayers []gopacket.LayerType
-		parser        = gopacket.NewDecodingLayerParser(layers.LayerTypeGRE, &llc, &gre, &ip4, &payload)
-		buf           = gopacket.NewSerializeBuffer()
-	)
-
 forever:
 	for {
 		select {
@@ -153,6 +200,9 @@ forever:
 		default:
 		}
 
+		// This is the primary notification mechanism for us to wake up and
+		// receive packets. Note that although we get a single notification here,
+		// there are likely multiple packets that we're able to receive at once.
 		if _, err := windows.WaitForSingleObject(session.ReadWaitEvent(), windows.INFINITE); err != nil {
 			a.logger.Warn(
 				"error waiting for read wait event",
@@ -160,87 +210,43 @@ forever:
 			continue
 		}
 
-		packet, err := session.ReceivePacket()
-		if err != nil {
-			a.logger.Warn(
-				"error receiving packet",
-				"error", err)
-			continue
-		}
-
-		if err := parser.DecodeLayers(packet, &decodedLayers); err != nil {
-			a.logger.Warn(
-				"error decoding layers",
-				"error", err)
-			goto cleanupReceivePacket
-		}
-
-		for _, layer := range decodedLayers {
-			switch layer {
-			case layers.LayerTypeGRE:
-				if gre.Protocol != layers.EthernetTypeIPv4 {
-					continue
-				}
+		// The inner loop spins on receiving packets multiple times before we fall
+		// back to waiting for a notification for performance reasons.
+		var consecutiveMisses int
+		for {
+			if consecutiveMisses >= missThreshold {
+				break
 			}
-		}
 
-		if ip4.SrcIP.Equal(a.otherSide) && ip4.DstIP.Equal(a.thisSide) {
-			if err := a.deencapsulate(buf, payload); err != nil {
+			packet, err := session.ReceivePacket()
+			if err != nil {
+				consecutiveMisses++
+				continue
+			} else {
+				consecutiveMisses = 0
+			}
+
+			if err := a.router.Route(session, packet); err != nil {
 				a.logger.Warn(
-					"error deencapsulating packet",
+					"error routing packet",
 					"error", err)
-				goto cleanupReceivePacket
 			}
-		} else {
-			if err := a.encapsulate(buf, ip4, payload); err != nil {
-				a.logger.Warn(
-					"error encapsulating packet",
-					"error", err)
-				goto cleanupReceivePacket
-			}
-		}
-		session.SendPacket(buf.Bytes())
 
-	cleanupReceivePacket:
-		session.ReleaseReceivePacket(packet)
-	}
+			session.ReleaseReceivePacket(packet)
+		} // inner loop
+	} // forever loop
 }
 
-func (a *GREAdapter) deencapsulate(buf gopacket.SerializeBuffer, payload gopacket.Payload) error {
-	if err := payload.SerializeTo(buf, gopacket.SerializeOptions{
-		FixLengths:       false,
-		ComputeChecksums: false,
-	}); err != nil {
-		return err
+func (a *GREAdapter) nextCounter() uint16 {
+	defer func() {
+		a.counter++
+	}()
+
+	if a.counter > math.MaxUint16 {
+		a.counter = 0
 	}
 
-	return nil
-}
-
-func (a *GREAdapter) encapsulate(buf gopacket.SerializeBuffer, ip4 layers.IPv4, payload gopacket.Payload) error {
-	returnOpts := gopacket.SerializeOptions{
-		FixLengths:       false,
-		ComputeChecksums: true,
-	}
-	if err := payload.SerializeTo(buf, returnOpts); err != nil {
-		return err
-	}
-
-	ip4.SrcIP = a.thisSide
-	ip4.DstIP = a.otherSide
-	if err := ip4.SerializeTo(buf, returnOpts); err != nil {
-		return err
-	}
-
-	gre := layers.GRE{
-		ChecksumPresent: true,
-		Protocol:        layers.EthernetTypeIPv4,
-	}
-	if err := gre.SerializeTo(buf, returnOpts); err != nil {
-		return err
-	}
-
-	return nil
+	return a.counter
 }
 
 func removeOrphanedProfile(adapterName string) error {
