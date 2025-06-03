@@ -197,6 +197,8 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 }
 
 func (pr *PacketRouting) PingAccessTiers(session wintun.Session) {
+	pr.healthCheck.SetNumExpected(pr.adapter.router.validSrcs.Size())
+
 	src := pr.adapter.tunnelIP
 	pr.adapter.router.validSrcs.Range(func(atGREIP string, _ net.IP) bool {
 		dst := net.ParseIP(atGREIP)
