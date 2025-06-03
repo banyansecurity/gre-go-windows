@@ -210,7 +210,7 @@ func (pr *PacketRouting) PingAccessTiers(session wintun.Session) {
 	})
 }
 
-func (pr *PacketRouting) HeathCheck() ([]string, bool) {
+func (pr *PacketRouting) HealthCheck() ([]string, bool) {
 	return pr.healthCheck.Status()
 }
 

@@ -97,7 +97,7 @@ func (a *GREAdapter) PacketRouting() *PacketRouting {
 }
 
 func (a *GREAdapter) Status() ([]string, bool) {
-	return a.router.HeathCheck()
+	return a.router.HealthCheck()
 }
 
 func (a *GREAdapter) WithDNSIP(dnsIP net.IP) *GREAdapter {
