@@ -176,6 +176,7 @@ func (a *GREAdapter) Close() error {
 	defer a.shutdownGroup.Wait()
 	defer func() {
 		_ = wintun.Uninstall()
+		_ = removeOrphanedProfile(a.name)
 	}()
 
 	for _, shutdownChan := range a.shutdownChans {
@@ -247,9 +248,11 @@ forever:
 	a.logger.Info("session runner shutting down")
 }
 
+const pingInterval = 2 * time.Minute
+
 func (a *GREAdapter) pinger(session wintun.Session, shutdownChan chan struct{}) {
 	defer a.shutdownGroup.Done()
-	ticker := time.NewTicker(2 * time.Minute)
+	ticker := time.NewTicker(pingInterval)
 
 forever:
 	for {
