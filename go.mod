@@ -10,4 +10,8 @@ require (
 	golang.zx2c4.com/wireguard/windows v0.5.3
 )
 
-require go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
+require (
+	github.com/google/uuid v1.6.0
+	github.com/pkg/errors v0.9.1
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
+)

@@ -6,14 +6,15 @@ import (
 	"math"
 	"math/rand"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wintun"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
@@ -30,7 +31,6 @@ const (
 type (
 	GREAdapter struct {
 		sync.RWMutex
-		logFile       *os.File
 		logger        *slog.Logger
 		name          string
 		guid          *windows.GUID
@@ -53,14 +53,19 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 	_ = wintun.Uninstall()
 	_ = removeOrphanedProfile(adapterName)
 
-	logFile, err := os.OpenFile(greLogFileName, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return nil, err
-	}
-
-	logger := slog.New(slog.NewJSONHandler(logFile, &slog.HandlerOptions{
-		Level: slog.LevelWarn,
-	}))
+	var (
+		ljLogger = &lumberjack.Logger{
+			Filename:   greLogFileName,
+			MaxSize:    5,
+			MaxBackups: 2,
+			MaxAge:     28,
+		}
+		_      = ljLogger.Rotate()
+		logger = slog.New(slog.NewJSONHandler(ljLogger, &slog.HandlerOptions{
+			AddSource: true,
+			Level:     slog.LevelDebug,
+		}))
+	)
 
 	guid, err := windows.GenerateGUID()
 	if err != nil {
@@ -76,7 +81,6 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 		"created adapter",
 		"luid", adapter.LUID())
 	greAdapter := &GREAdapter{
-		logFile: logFile,
 		logger:  logger,
 		name:    adapterName,
 		guid:    &guid,
@@ -90,6 +94,10 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 
 func (a *GREAdapter) PacketRouting() *PacketRouting {
 	return a.router
+}
+
+func (a *GREAdapter) Status() ([]string, bool) {
+	return a.router.HealthCheck()
 }
 
 func (a *GREAdapter) WithDNSIP(dnsIP net.IP) *GREAdapter {
@@ -157,7 +165,7 @@ func (a *GREAdapter) Start() {
 	shutdownChan := make(chan struct{})
 	a.shutdownChans = append(a.shutdownChans, shutdownChan)
 
-	a.shutdownGroup.Add(1)
+	a.shutdownGroup.Add(2)
 	go a.sessionRunner(shutdownChan)
 }
 
@@ -169,7 +177,6 @@ func (a *GREAdapter) Close() error {
 	defer func() {
 		_ = wintun.Uninstall()
 		_ = removeOrphanedProfile(a.name)
-		_ = a.logFile.Close()
 	}()
 
 	for _, shutdownChan := range a.shutdownChans {
@@ -191,6 +198,8 @@ func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
 		return
 	}
 	defer session.End()
+
+	go a.pinger(session, shutdownChan)
 
 forever:
 	for {
@@ -235,6 +244,28 @@ forever:
 			session.ReleaseReceivePacket(packet)
 		} // inner loop
 	} // forever loop
+
+	a.logger.Info("session runner shutting down")
+}
+
+const pingInterval = 2 * time.Minute
+
+func (a *GREAdapter) pinger(session wintun.Session, shutdownChan chan struct{}) {
+	defer a.shutdownGroup.Done()
+	ticker := time.NewTicker(pingInterval)
+
+forever:
+	for {
+		a.router.PingAccessTiers(session)
+
+		select {
+		case <-shutdownChan:
+			break forever
+		case <-ticker.C:
+		}
+	} // forever loop
+
+	a.logger.Info("pinger shutting down")
 }
 
 func (a *GREAdapter) nextCounter() uint16 {

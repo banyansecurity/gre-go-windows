@@ -2,10 +2,13 @@ package gre
 
 import (
 	"errors"
+	"math"
+	"math/rand"
 	"net"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"github.com/google/uuid"
 	"golang.zx2c4.com/wintun"
 )
 
@@ -26,6 +29,7 @@ const (
 
 var (
 	ErrCannotProxyDNS       = errors.New("cannot proxy because payload does not appear to be dns")
+	ErrNotHealthCheckReply  = errors.New("not a health check reply")
 	ErrCannotProxyICMPReply = errors.New("cannot proxy because payload does not appear to be icmp reply")
 )
 
@@ -330,6 +334,132 @@ func (dp *DNSPacketOutboundProxy) Handle(rm *RequestMetadata, packet []byte) err
 	copy(outgoingPacket, payload)
 	dp.session.SendPacket(outgoingPacket)
 	return nil
+}
+
+type ICMP4HealthCheck struct {
+	adapter    *GREAdapter
+	session    wintun.Session
+	ip4        *layers.IPv4
+	icmp       *layers.ICMPv4
+	icmpParser *gopacket.DecodingLayerParser
+	decoded    []gopacket.LayerType
+	buf        gopacket.SerializeBuffer
+	opts       gopacket.SerializeOptions
+	payload    gopacket.Payload
+	counter    uint16
+}
+
+const (
+	icmp4RequestPayloadSize = 32
+	icmp4RequestID          = 7331
+)
+
+var (
+	icmp4Payload = []byte(uuid.New().String())[:icmp4RequestPayloadSize]
+)
+
+func NewICMP4HealthCheck(adapter *GREAdapter) *ICMP4HealthCheck {
+	var (
+		ip4        = &layers.IPv4{}
+		icmp       = &layers.ICMPv4{}
+		icmpParser = gopacket.NewDecodingLayerParser(layers.LayerTypeICMPv4, icmp)
+	)
+	icmpParser.IgnoreUnsupported = true
+
+	return &ICMP4HealthCheck{
+		adapter:    adapter,
+		ip4:        ip4,
+		icmp:       icmp,
+		icmpParser: icmpParser,
+		decoded:    make([]gopacket.LayerType, 1),
+		buf:        gopacket.NewSerializeBuffer(),
+		opts: gopacket.SerializeOptions{
+			ComputeChecksums: true,
+			FixLengths:       true,
+		},
+		payload: icmp4Payload,
+		counter: uint16(rand.Intn(math.MaxUint16 + 1)),
+	}
+}
+
+func (ic *ICMP4HealthCheck) UseSession(session wintun.Session) *ICMP4HealthCheck {
+	ic.session = session
+	return ic
+}
+
+func (ic *ICMP4HealthCheck) HandleRequest(src, dst net.IP) error {
+	defer func() {
+		ic.counter++
+	}()
+
+	ic.ip4.Version = 4
+	ic.ip4.Id = ic.adapter.nextCounter()
+	ic.ip4.Flags = layers.IPv4DontFragment
+	ic.ip4.TTL = defaultTTL
+	ic.ip4.Protocol = layers.IPProtocolICMPv4
+	ic.ip4.SrcIP = src
+	ic.ip4.DstIP = dst
+
+	ic.icmp.TypeCode = layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0)
+	ic.icmp.Checksum = 0
+	ic.icmp.Id = icmp4RequestID
+	ic.icmp.Seq = ic.counter
+	ic.icmp.Payload = ic.payload
+
+	serializingPayload := gopacket.Payload(ic.icmp.LayerPayload())
+	if err := gopacket.SerializeLayers(ic.buf, ic.opts, ic.ip4, ic.icmp, serializingPayload); err != nil {
+		return err
+	}
+
+	var (
+		payload   = ic.buf.Bytes()
+		totalSize = len(payload)
+	)
+	outgoingPacket, err := ic.session.AllocateSendPacket(totalSize)
+	if err != nil {
+		return err
+	}
+
+	copy(outgoingPacket, payload)
+	ic.session.SendPacket(outgoingPacket)
+	return nil
+}
+
+func (ic *ICMP4HealthCheck) IsHealthCheckReply(packet []byte) bool {
+	if err := ic.icmpParser.DecodeLayers(packet, &ic.decoded); err != nil {
+		ic.adapter.logger.Debug(
+			"not a health check reply",
+			"error", err,
+		)
+		return false
+	}
+
+	if icmpType := ic.icmp.TypeCode.Type(); icmpType != layers.ICMPv4TypeEchoReply {
+		ic.adapter.logger.Debug(
+			"not a health check reply",
+			"expected", layers.ICMPv4TypeEchoReply,
+			"actual", icmpType,
+		)
+		return false
+	}
+
+	// The return packet has our unique identifier. Not sure if we ought to check
+	// the sequence number here as well.
+	if ic.icmp.Id == icmp4RequestID {
+		ic.adapter.logger.Debug(
+			"health check reply",
+			"expected", icmp4RequestID,
+			"actual", ic.icmp.Id,
+		)
+		return true
+	}
+
+	ic.adapter.logger.Debug(
+		"not a health check reply",
+		"expected", icmp4RequestID,
+		"actual", ic.icmp.Id,
+	)
+	return false
 }
 
 type ICMP4PacketReplyProxy struct {

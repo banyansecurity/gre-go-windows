@@ -1,19 +1,23 @@
 package gre
 
 import (
+	"fmt"
 	"net"
 
 	"github.com/google/gopacket/layers"
 )
 
 type RequestMetadata struct {
+	cid             string
 	outerIP4        *layers.IPv4
 	accessTierGREIP net.IP
 	connectorGREIP  net.IP
 }
 
-func NewRequestMetadata() *RequestMetadata {
-	return &RequestMetadata{}
+func NewRequestMetadata(cid string) *RequestMetadata {
+	return &RequestMetadata{
+		cid: cid,
+	}
 }
 
 func (rm *RequestMetadata) WithOuterIP4(outerIP4 *layers.IPv4) *RequestMetadata {
@@ -41,4 +45,10 @@ func (rm *RequestMetadata) WithConnectorGREIP(connectorGREIP net.IP) *RequestMet
 
 func (rm *RequestMetadata) ConnectorGREIP() net.IP {
 	return rm.connectorGREIP
+}
+
+func (rm *RequestMetadata) String() string {
+	return fmt.Sprintf(
+		"{cid: %s, outerIP4: (%+v), accessTierGREIP: %s, connectorGREIP: %s}",
+		rm.cid, rm.outerIP4, rm.accessTierGREIP.String(), rm.connectorGREIP.String())
 }
