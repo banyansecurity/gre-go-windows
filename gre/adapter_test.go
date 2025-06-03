@@ -1,7 +1,6 @@
 package gre
 
 import (
-	"net"
 	"testing"
 	"time"
 
@@ -43,7 +42,7 @@ func TestNewDefaultGREAdapter(t *testing.T) {
 func TestNewGREAdapter(t *testing.T) {
 	adapterName := "test0"
 	if err := elevate.DoAsSystem(func() error {
-		adapter, err := NewGREAdapter(adapterName, net.ParseIP("100.100.0.0"), net.ParseIP("100.120.0.0"))
+		adapter, err := NewGREAdapter(adapterName)
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
