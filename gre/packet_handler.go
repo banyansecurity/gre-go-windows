@@ -347,7 +347,6 @@ type ICMP4HealthCheck struct {
 	opts       gopacket.SerializeOptions
 	payload    gopacket.Payload
 	counter    uint16
-	numPeers   int
 }
 
 const (
@@ -385,11 +384,6 @@ func NewICMP4HealthCheck(adapter *GREAdapter) *ICMP4HealthCheck {
 
 func (ic *ICMP4HealthCheck) UseSession(session wintun.Session) *ICMP4HealthCheck {
 	ic.session = session
-	return ic
-}
-
-func (ic *ICMP4HealthCheck) Expect(numPeers int) *ICMP4HealthCheck {
-	ic.numPeers = numPeers
 	return ic
 }
 
