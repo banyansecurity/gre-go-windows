@@ -24,7 +24,7 @@ var (
 const (
 	defaultAdapterName = "mgre1"
 	wintunTunnelType   = "Wintun"
-	sessionCapacity    = 0x400000
+	sessionCapacity    = 0x800000
 	profilesPath       = "Software\\Microsoft\\Windows NT\\CurrentVersion\\NetworkList\\Profiles"
 )
 
@@ -63,7 +63,7 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 		_      = ljLogger.Rotate()
 		logger = slog.New(slog.NewJSONHandler(ljLogger, &slog.HandlerOptions{
 			AddSource: true,
-			Level:     slog.LevelDebug,
+			Level:     slog.LevelWarn,
 		}))
 	)
 
@@ -186,7 +186,7 @@ func (a *GREAdapter) Close() error {
 	return a.adapter.Close()
 }
 
-const missThreshold = 100
+const missThreshold = 10_000_000
 
 func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
 	defer a.shutdownGroup.Done()

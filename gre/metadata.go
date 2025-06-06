@@ -8,13 +8,13 @@ import (
 )
 
 type RequestMetadata struct {
-	cid             string
+	cid             uint64
 	outerIP4        *layers.IPv4
 	accessTierGREIP net.IP
 	connectorGREIP  net.IP
 }
 
-func NewRequestMetadata(cid string) *RequestMetadata {
+func NewRequestMetadata(cid uint64) *RequestMetadata {
 	return &RequestMetadata{
 		cid: cid,
 	}

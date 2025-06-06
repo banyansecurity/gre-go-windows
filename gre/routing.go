@@ -3,11 +3,11 @@ package gre
 import (
 	"net"
 	"strings"
+	"sync/atomic"
 
 	"github.com/banyansecurity/gre-go-windows/health"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/google/uuid"
 	"github.com/pkg/errors"
 	"github.com/puzpuzpuz/xsync"
 	"golang.zx2c4.com/wintun"
@@ -15,6 +15,7 @@ import (
 
 type (
 	PacketRouting struct {
+		packetCounter          atomic.Uint64
 		adapter                *GREAdapter
 		ip4                    *layers.IPv4
 		ipParser               *gopacket.DecodingLayerParser
@@ -39,6 +40,7 @@ func NewPacketRouting(adapter *GREAdapter) *PacketRouting {
 	ipParser.IgnoreUnsupported = true
 
 	return &PacketRouting{
+		packetCounter:          atomic.Uint64{},
 		adapter:                adapter,
 		ip4:                    ip4,
 		ipParser:               ipParser,
@@ -68,7 +70,8 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 		}
 	}
 
-	cid := uuid.New().String()
+	cid := pr.nextCID()
+
 	pr.adapter.logger.Debug(
 		"handling packet",
 		"cid", cid,
@@ -80,7 +83,6 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 		rm := NewRequestMetadata(cid).WithOuterIP4(pr.ip4).WithAccessTierGREIP(pr.ip4.SrcIP)
 		pr.adapter.logger.Debug(
 			"handling inbound gre packet",
-			"metadata", rm.String(),
 		)
 
 		if err := pr.greDeencapsulator.UseSession(session).Handle(rm, pr.ip4.LayerPayload()); err != nil {
@@ -94,7 +96,6 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 			)
 			pr.adapter.logger.Debug(
 				"handling inbound dns packet",
-				"metadata", rm.String(),
 				"connectorIP", connectorIP,
 			)
 
@@ -111,12 +112,25 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 			rm := NewRequestMetadata(cid).WithOuterIP4(pr.ip4).WithAccessTierGREIP(accessTierIP)
 			pr.adapter.logger.Debug(
 				"handling outbound dns packet",
-				"metadata", rm.String(),
 				"accessTierIP", accessTierIP,
 			)
 
 			if err := pr.dnsPacketOutboundProxy.UseSession(session).Handle(rm, pr.ip4.LayerPayload()); err != nil {
-				return errors.Wrap(err, "dns outbound proxy")
+				// If we're not dealing with a DNS packet, then we can treat this as a
+				// regular UDP traffic that requires GRE encapsulation on the way back.
+				if errors.Is(err, ErrCannotProxyDNS) {
+					rm := NewRequestMetadata(cid).WithOuterIP4(pr.ip4).WithAccessTierGREIP(accessTierIP)
+					pr.adapter.logger.Debug(
+						"handling outbound gre packet",
+						"accessTierIP", accessTierIP,
+					)
+
+					if err := pr.greEncapsulator.UseSession(session).Handle(rm, packet); err != nil {
+						return errors.Wrap(err, "gre encapsulator")
+					}
+				} else {
+					return errors.Wrap(err, "dns outbound proxy")
+				}
 			}
 		} else {
 			pr.adapter.logger.Debug(
@@ -152,7 +166,6 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 			rm := NewRequestMetadata(cid).WithOuterIP4(pr.ip4).WithAccessTierGREIP(accessTierIP)
 			pr.adapter.logger.Debug(
 				"handling outbound gre packet (icmp)",
-				"metadata", rm.String(),
 				"accessTierIP", accessTierIP,
 			)
 
@@ -174,7 +187,6 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 			rm := NewRequestMetadata(cid).WithOuterIP4(pr.ip4).WithAccessTierGREIP(accessTierIP)
 			pr.adapter.logger.Debug(
 				"handling outbound gre packet",
-				"metadata", rm.String(),
 				"accessTierIP", accessTierIP,
 			)
 
@@ -274,4 +286,9 @@ func (pr *PacketRouting) passthrough(err error) bool {
 	}
 
 	return false
+}
+
+func (pr *PacketRouting) nextCID() uint64 {
+	pr.packetCounter.Add(1)
+	return pr.packetCounter.Load()
 }
