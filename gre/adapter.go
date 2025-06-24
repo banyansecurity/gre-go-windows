@@ -38,6 +38,7 @@ type (
 		adapter       *wintun.Adapter
 		tunnelIP      net.IP
 		dnsIP         net.IP
+		interfaceIP   net.IP
 		shutdownChans []chan struct{}
 		shutdownGroup sync.WaitGroup
 		counter       uint16
@@ -98,6 +99,21 @@ func (a *GREAdapter) PacketRouting() *PacketRouting {
 
 func (a *GREAdapter) Status() ([]string, bool) {
 	return a.router.HealthCheck()
+}
+
+func (a *GREAdapter) WithInterfaceIP(interfaceIP net.IP) *GREAdapter {
+	a.Lock()
+	defer a.Unlock()
+
+	a.interfaceIP = interfaceIP
+	return a
+}
+
+func (a *GREAdapter) InterfaceIP() net.IP {
+	a.RLock()
+	defer a.RUnlock()
+
+	return a.interfaceIP
 }
 
 func (a *GREAdapter) WithDNSIP(dnsIP net.IP) *GREAdapter {

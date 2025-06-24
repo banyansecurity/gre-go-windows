@@ -311,8 +311,16 @@ func (dp *DNSPacketOutboundProxy) Handle(rm *RequestMetadata, packet []byte) err
 	dp.innerIP4.Flags = layers.IPv4DontFragment
 	dp.innerIP4.TTL = defaultTTL
 	dp.innerIP4.Protocol = layers.IPProtocolUDP
-	dp.innerIP4.SrcIP = dp.adapter.TunnelIP()
-	dp.innerIP4.DstIP = rm.AccessTierGREIP()
+
+	if rm.OuterIP4().SrcIP.Equal(dp.adapter.DNSIP()) {
+		dp.innerIP4.SrcIP = dp.adapter.TunnelIP()
+		dp.innerIP4.DstIP = rm.AccessTierGREIP()
+	} else {
+		// This is the case where a tunnel client is trying to send a DNS packet
+		// over the tunnel rather than AT / connector handling the DNS request.
+		dp.innerIP4.SrcIP = rm.OuterIP4().SrcIP
+		dp.innerIP4.DstIP = rm.OuterIP4().DstIP
+	}
 
 	dp.udp.Checksum = 0
 	dp.udp.SetNetworkLayerForChecksum(dp.innerIP4)
@@ -517,7 +525,7 @@ func (ic *ICMP4PacketReplyProxy) Handle(rm *RequestMetadata, packet []byte) erro
 	ic.ip4.TTL = defaultTTL
 	ic.ip4.Protocol = layers.IPProtocolICMPv4
 	ic.ip4.SrcIP = ic.adapter.TunnelIP()
-	ic.ip4.DstIP = net.IPv4(172, 31, 28, 127)
+	ic.ip4.DstIP = ic.adapter.InterfaceIP()
 
 	ic.icmp.Checksum = 0
 

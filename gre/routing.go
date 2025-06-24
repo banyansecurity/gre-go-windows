@@ -143,7 +143,14 @@ func (pr *PacketRouting) Route(session wintun.Session, packet []byte) error {
 			}
 		}
 	case layers.IPProtocolICMPv4:
-		if pr.maybeHealthCheck(*pr.ip4) {
+		if pr.maybeInfinitePingLoop(*pr.ip4) {
+			pr.adapter.logger.Warn(
+				"infinite ping loop detected, dropping packet",
+				"cid", cid,
+				"ip4", pr.ip4,
+			)
+			return nil
+		} else if pr.maybeHealthCheck(*pr.ip4) {
 			pr.adapter.logger.Debug(
 				"handling health check",
 				"cid", cid,
@@ -263,6 +270,15 @@ func (pr *PacketRouting) maybeHealthCheck(ip4 layers.IPv4) bool {
 	)
 
 	return ip4.Protocol == layers.IPProtocolICMPv4 && srcIsAccessTier && dstIsTunnelIP
+}
+
+// maybeInfinitePingLoop captures the case where a rogue ping might come in on
+// the interface IP. We'll just drop this packet if it shows up since it'll
+// cause an infinite redirect inside the interface which Windows will detect
+// and cause all traffic to the interface to drop. This is probably because of
+// the TTL triggering.
+func (pr *PacketRouting) maybeInfinitePingLoop(ip4 layers.IPv4) bool {
+	return ip4.Protocol == layers.IPProtocolICMPv4 && ip4.SrcIP.Equal(pr.adapter.InterfaceIP()) && ip4.DstIP.Equal(pr.adapter.TunnelIP())
 }
 
 func (pr *PacketRouting) sendAsIs(session wintun.Session, packet []byte) error {
