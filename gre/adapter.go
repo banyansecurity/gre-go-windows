@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/banyansecurity/gre-go-windows/utils"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"golang.zx2c4.com/wintun"
@@ -67,6 +68,8 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 			Level:     slog.LevelWarn,
 		}))
 	)
+	utils.FileLogger = ljLogger
+	utils.PanicLogger = logger
 
 	guid, err := windows.GenerateGUID()
 	if err != nil {
@@ -186,10 +189,14 @@ func (a *GREAdapter) Start() {
 }
 
 func (a *GREAdapter) Close() error {
+	defer a.shutdownGroup.Wait()
+
+	// Defer unlocking after the wait group so that we don't get a deadlock.
+	// This routine needs to release its lock first to allow Goroutines behind
+	// the wait group to proceed.
 	a.Lock()
 	defer a.Unlock()
 
-	defer a.shutdownGroup.Wait()
 	defer func() {
 		_ = wintun.Uninstall()
 		_ = removeOrphanedProfile(a.name)
@@ -198,13 +205,14 @@ func (a *GREAdapter) Close() error {
 	for _, shutdownChan := range a.shutdownChans {
 		close(shutdownChan)
 	}
-
-	return a.adapter.Close()
+	_ = a.adapter.Close()
+	return nil
 }
 
 const missThreshold = 10_000_000
 
 func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
+	defer utils.PanicCrash()
 	defer a.shutdownGroup.Done()
 	session, err := a.adapter.StartSession(sessionCapacity)
 	if err != nil {
@@ -267,6 +275,7 @@ forever:
 const pingInterval = 2 * time.Minute
 
 func (a *GREAdapter) pinger(session wintun.Session, shutdownChan chan struct{}) {
+	defer utils.PanicCrash()
 	defer a.shutdownGroup.Done()
 	ticker := time.NewTicker(pingInterval)
 
