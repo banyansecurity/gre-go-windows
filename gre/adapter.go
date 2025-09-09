@@ -205,8 +205,7 @@ func (a *GREAdapter) Close() error {
 	for _, shutdownChan := range a.shutdownChans {
 		close(shutdownChan)
 	}
-	_ = a.adapter.Close()
-	return nil
+	return a.adapter.Close()
 }
 
 const missThreshold = 10_000_000
