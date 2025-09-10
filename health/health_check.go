@@ -4,6 +4,8 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"github.com/banyansecurity/gre-go-windows/utils"
 )
 
 type ReachablePeers struct {
@@ -40,6 +42,8 @@ const (
 )
 
 func (hc *HealthCheck) promoter() {
+	defer utils.PanicCrash()
+
 	for {
 		time.Sleep(pollInterval)
 
