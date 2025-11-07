@@ -1,3 +1,3 @@
-# gre-go
+# gre-go-windows
 
-A prototype that implements a simple GRE tunnel (RFC 2784) in Go using the Wintun library.
+A library that implements a simple GRE tunnel (RFC 2784) in Go using the Wintun framework.
