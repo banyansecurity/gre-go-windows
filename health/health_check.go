@@ -38,7 +38,7 @@ func NewHealthCheck() *HealthCheck {
 
 const (
 	pollInterval = 1 * time.Second
-	timeout      = 10 * time.Second
+	timeout      = 5 * time.Minute
 )
 
 func (hc *HealthCheck) promoter() {
@@ -59,7 +59,7 @@ func (hc *HealthCheck) promoter() {
 
 		if swap {
 			hc.current = hc.next
-			hc.next = nil
+			hc.next = NewReachablePeers()
 		}
 		hc.Unlock()
 	}
@@ -80,6 +80,13 @@ func (hc *HealthCheck) NumExpected() int {
 	return hc.numExpected
 }
 
+func (hc *HealthCheck) NumActual() int {
+	hc.RLock()
+	defer hc.RUnlock()
+
+	return len(hc.current.Peers)
+}
+
 func (hc *HealthCheck) AddReachable(ip net.IP) {
 	hc.Lock()
 	defer hc.Unlock()
@@ -88,7 +95,20 @@ func (hc *HealthCheck) AddReachable(ip net.IP) {
 		hc.next = NewReachablePeers()
 	}
 
-	hc.next.Peers = append(hc.next.Peers, ip.String())
+	var (
+		newIP   = ip.String()
+		present bool
+	)
+	for _, peer := range hc.next.Peers {
+		if peer == newIP {
+			present = true
+		}
+	}
+
+	// Check if this IP is already in the peers before adding.
+	if !present {
+		hc.next.Peers = append(hc.next.Peers, newIP)
+	}
 	if len(hc.next.Peers) == hc.numExpected {
 		hc.next.Dirty = false
 	}
