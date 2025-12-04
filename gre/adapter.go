@@ -98,8 +98,8 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 }
 
 func (a *GREAdapter) PacketRouting() *PacketRouting {
-	a.Lock()
-	defer a.Unlock()
+	a.RLock()
+	defer a.RUnlock()
 
 	return a.router
 }

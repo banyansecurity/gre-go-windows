@@ -102,6 +102,7 @@ func (hc *HealthCheck) AddReachable(ip net.IP) {
 	for _, peer := range hc.next.Peers {
 		if peer == newIP {
 			present = true
+			break
 		}
 	}
 
