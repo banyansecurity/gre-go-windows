@@ -65,7 +65,7 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 		_      = ljLogger.Rotate()
 		logger = slog.New(slog.NewJSONHandler(ljLogger, &slog.HandlerOptions{
 			AddSource: true,
-			Level:     slog.LevelWarn,
+			Level:     slog.LevelInfo,
 		}))
 	)
 	utils.FileLogger = ljLogger
@@ -83,6 +83,7 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 
 	logger.Info(
 		"created adapter",
+		"name", adapterName,
 		"luid", adapter.LUID())
 	greAdapter := &GREAdapter{
 		logger:  logger,
@@ -97,10 +98,16 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 }
 
 func (a *GREAdapter) PacketRouting() *PacketRouting {
+	a.RLock()
+	defer a.RUnlock()
+
 	return a.router
 }
 
 func (a *GREAdapter) Status() ([]string, bool) {
+	a.RLock()
+	defer a.RUnlock()
+
 	return a.router.HealthCheck()
 }
 
@@ -109,6 +116,9 @@ func (a *GREAdapter) WithInterfaceIP(interfaceIP net.IP) *GREAdapter {
 	defer a.Unlock()
 
 	a.interfaceIP = interfaceIP
+	a.logger.Info(
+		"set interface ip",
+		"ip", interfaceIP)
 	return a
 }
 
@@ -124,6 +134,9 @@ func (a *GREAdapter) WithDNSIP(dnsIP net.IP) *GREAdapter {
 	defer a.Unlock()
 
 	a.dnsIP = dnsIP
+	a.logger.Info(
+		"set dns ip",
+		"ip", dnsIP)
 	return a
 }
 
@@ -139,6 +152,9 @@ func (a *GREAdapter) WithTunnelIP(tunnelIP net.IP) *GREAdapter {
 	defer a.Unlock()
 
 	a.tunnelIP = tunnelIP
+	a.logger.Info(
+		"set tunnel ip",
+		"ip", tunnelIP)
 	return a
 }
 
@@ -186,6 +202,7 @@ func (a *GREAdapter) Start() {
 
 	a.shutdownGroup.Add(2)
 	go a.sessionRunner(shutdownChan)
+	a.logger.Info("started adapter routines")
 }
 
 func (a *GREAdapter) Close() error {
@@ -205,6 +222,8 @@ func (a *GREAdapter) Close() error {
 	for _, shutdownChan := range a.shutdownChans {
 		close(shutdownChan)
 	}
+
+	a.logger.Info("stopped adapter routines")
 	return a.adapter.Close()
 }
 
@@ -223,6 +242,7 @@ func (a *GREAdapter) sessionRunner(shutdownChan chan struct{}) {
 	defer session.End()
 
 	go a.pinger(session, shutdownChan)
+	a.logger.Info("started session runner")
 
 forever:
 	for {
@@ -277,6 +297,7 @@ func (a *GREAdapter) pinger(session wintun.Session, shutdownChan chan struct{}) 
 	defer utils.PanicCrash()
 	defer a.shutdownGroup.Done()
 	ticker := time.NewTicker(pingInterval)
+	a.logger.Info("started pinger")
 
 forever:
 	for {
