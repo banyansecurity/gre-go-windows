@@ -84,6 +84,10 @@ func (hc *HealthCheck) NumActual() int {
 	hc.RLock()
 	defer hc.RUnlock()
 
+	if hc.current == nil {
+		return 0
+	}
+
 	return len(hc.current.Peers)
 }
 
