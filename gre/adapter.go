@@ -76,9 +76,25 @@ func NewGREAdapter(adapterName string) (*GREAdapter, error) {
 		return nil, err
 	}
 
-	adapter, err := wintun.CreateAdapter(adapterName, wintunTunnelType, &guid)
+	var adapter *wintun.Adapter
+
+	for i := 0; i < 10; i++ {
+		if i > 0 {
+			time.Sleep(2 * time.Second)
+			logger.Warn("retrying CreateAdapter for the GRE Adapter", "name", adapterName, "attempt", i)
+		}
+
+		adapter, err = wintun.CreateAdapter(adapterName, wintunTunnelType, &guid)
+		if err != nil {
+			logger.Warn("CreateAdapter for the GRE Adapter failed", "error", err)
+		}
+		if err == nil {
+			break
+		}
+	}
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create GRE Adapter, err:%w", err)
 	}
 
 	logger.Info(
